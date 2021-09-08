@@ -1,0 +1,180 @@
+library(tidyverse)
+library(parma)
+library(data.table)
+
+
+setwd("C:/Users/Nicoletta/Desktop/DPM/")
+#Load Data
+rets_df <- readxl::read_excel("live_ports_ts_monthly.xlsx", sheet ="Foglio2") %>% as_tibble() %>% mutate(date = as.Date(date))
+assetdb <- readxl::read_excel("assetdb.xlsx", sheet = "Foglio1") %>% as_tibble()
+currencydb <- readxl::read_excel("currencydb.xlsx", sheet = "Foglio2") %>% as_tibble() %>% mutate(date = as.Date(date)) %>% 
+  gather(key = ccy, value = rate, -date) %>% 
+  group_by(ccy) %>% mutate(ccy_ret = rate/lag(rate)-1) %>% na.omit()
+#Load data into a tibble
+rets_df_long <- rets_df %>% gather(key = index, value = level, -date) %>% 
+  left_join(assetdb %>% select(asset_name, ccy), by = c("index" = "asset_name")) %>%
+  left_join(currencydb, by = c("date" = "date", "ccy" = "ccy")) %>%
+  group_by(index) %>% mutate(local_ret = level/lag(level)-1, ret = (1 + local_ret) * (1 - ccy_ret) - 1) %>% na.omit() %>% 
+  mutate(cum_ret = cumprod(1 + ret)-1)
+
+#Generate Cumulative return series
+rets_df_long %>% ggplot(aes( x = date, y = cum_ret, col = index)) + 
+  geom_line(size = 1) + 
+  scale_y_continuous(labels=scales::percent) + 
+  labs(title = "Investment Universe Cumulative Return", subtitle = "monthly returns, 2000 - to date in EUR", y = "Cumulative Return %", x = "Date", col = "Index") + 
+  theme_minimal()
+
+#Input for CovMat
+input_mat <- rets_df_long %>% 
+  select(date, index, ret) %>% spread(key = index, value = ret) %>% select(-date) %>% as.matrix()
+
+var_cov_mat_robust <- RiskPortfolios::covEstimation(rets = input_mat, control = list(type = "cor")) * 12
+
+risk_robust_df <- diag(var_cov_mat_robust) %>% as_tibble(.name_repair = ~ c("robust_risk"))  %>% add_column(index = names(diag(var_cov_mat_robust))) %>%
+  mutate(robust_risk = sqrt(robust_risk))
+
+risk_robust_df %>% ggplot(aes( x = index, y = robust_risk, fill = index)) + 
+  geom_col() + 
+  scale_y_continuous(labels=scales::percent) +
+  labs(title = "Investment Universe Annualised Risk", y = "Risk %", x = "Date", col = "Index") + 
+  theme_minimal()
+
+#plot correlogram
+cov2cor(var_cov_mat_robust) %>% corrplot::corrplot(method="number")
+
+#compute PCA Model (monthly frequency 15 years)
+
+source("Script/fit_pca_script.R") # not sure it works
+
+pca_model <- rets_df_long %>% select(date, index, ret) %>% spread(index, ret) %>%
+  fit_pca_roll(vars = colnames(select(., -date)), date_var = "date",
+               window = 120, step = 1)
+
+pca_model <- rets_df_long %>% select(date, index, ret) %>% spread(index, ret) %>%
+  fit_pca(vars = colnames(select(., -date)))
+  
+
+               
+
+plot_df <-
+  #'   fit_pca_roll(stock_returns, vars = colnames(select(stock_returns,-date)),
+  #'              date_var = "date", window = 60, step = 1) %>%
+  #'   tidy(pca, matrix = "pcs") %>%
+  #'   filter(PC < 5) %>%
+  #'   select(as_of, PC, percent) %>%
+  #'   ungroup() %>%
+  #'   mutate(as_of = as.Date(as_of))
+  #'
+  #' ggplot(plot_df, aes(x = as_of, y = percent, col = as.character(PC))) +
+  #'   geom_line()
+
+#get expected returns from Blackrock's CMAs website along with uncertainty
+
+cmas_df <- readxl::read_excel("cmas_exp_ret_file.xlsx", sheet ="Foglio1") %>% as_tibble() %>% arrange(asset_name)  
+
+mu <- cmas_df %>% select(exp_ret) %>% pull()
+
+n_assets <- length(mu)
+
+#generate a vector of random expected returns with the uncertainty distribution
+
+set.seed(11)
+
+###############################################################################
+# Portfolio 1
+#Constraints
+# lower_bound = rep(0, n_assets)
+# upper_bound = rep(1, n_assets)
+lower_bound = cmas_df$LB
+upper_bound = cmas_df$UB
+target_risk = 0.12
+
+#generate return simulations  
+sim_exp_ret <-   map2_dfc(.x = cmas_df$exp_ret, .y = cmas_df$uncertainty, ~rnorm(1000, mean = .x, sd = .y)) %>% 
+  setNames(cmas_df$asset_name) %>% 
+  mutate(sim_n = paste0("sim_",row_number()))
+
+sims <- select(sim_exp_ret, sim_n) %>% pull()
+
+sim_exp_ret_t <- sim_exp_ret %>% select(-sim_n) %>% as.matrix() %>%t() %>% as_tibble(.name_repair = ~ sims) %>% as.list()
+
+# optimal weights function
+get_opto_weights <- function(mu, S, target_risk, lower_bound, upper_bound) {
+  
+  spec = parmaspec(
+    forecast = mu, S = S,
+    risk = "EV", targetType = "equality",
+    target = NULL,
+    riskType = 'maxreward', riskB = target_risk,
+    LB = lower_bound, UB = upper_bound,
+    budget = 1
+  )
+  
+  names_df <- colnames(S)
+  asset_risk <- diag(S) %>% as_tibble(.name_repair = ~ c("robust_risk"))  %>% add_column(index = names(diag(S))) %>%
+    mutate(robust_risk = sqrt(robust_risk))
+  
+  opt_weights <- weights(parmasolve(spec)) 
+  opt_ret <- as.numeric(mu %*% opt_weights)
+  opt_risk <- as.numeric(sqrt(opt_weights %*% var_cov_mat_robust %*% opt_weights))
+  opt_car <- (((var_cov_mat_robust %*% opt_weights) / opt_risk) * opt_weights)*100
+  
+  opt_results <- tibble(asset = names_df, exp_ret = mu, port_ret = rep(as.numeric(mu %*% opt_weights), length(mu)), risk = asset_risk$robust_risk, port_risk = opt_risk, weights = opt_weights, car = as.numeric(opt_car) / 100, x_sigma = risk * weights, rho = car / x_sigma )
+  
+  return(opt_results)
+}
+
+#robust portfolios results
+rob_opt_df <- sim_exp_ret_t %>% map2_dfr(.x = , .y = names(.), .f = ~get_opto_weights(mu = pluck(.x), 
+                                                                                      S = var_cov_mat_robust, 
+                                                                                      lower_bound = lower_bound, 
+                                                                                      upper_bound = upper_bound, 
+                                                                                      target_risk = target_risk) %>% mutate(sim = .y))
+rob_opt_df %>% group_by(sim) %>%
+  summarise(port_ret = port_ret, div_ratio = sum(risk * weights)/target_risk) %>% unique() %>% 
+  arrange(desc(port_ret)) %>%
+  ggplot(aes( x = div_ratio, y = port_ret)) +
+  geom_point()
+
+rob_opt_df %>%
+  group_by(sim) %>%
+  summarise(port_ret = port_ret) %>% unique() %>%
+  ungroup() %>%
+  ggplot(aes(x = port_ret)) +
+  geom_density() + 
+  geom_vline(aes(xintercept=median(port_ret)),
+             color="blue", linetype="dashed", size=1) + 
+geom_histogram(binwidth=.0005, colour="black", fill="white") +
+  scale_x_continuous(labels=scales::percent) + 
+  labs(title = "Robust Optimization Return Distribution", y = "Density", x = "Portfolio Return %") +
+  theme_minimal()
+
+rank <- rob_opt_df %>% select(port_ret, sim) %>% unique() %>%
+  arrange(desc(port_ret)) %>%
+  mutate(quantile_rank = ntile(port_ret, 100)) %>% print(n = 50) + 
+  theme_minimal()
+  
+
+rob_opt_df %>% 
+  arrange(desc(port_ret)) %>%
+  mutate(quantile_rank = ntile(port_ret, 100)) %>% filter(quantile_rank <= 50) %>%
+  group_by(asset) %>%
+  summarise(rob_weight = mean(weights), port_ret = mean(port_ret), port_risk = mean(port_risk), car = mean(car), risk = mean(risk), x_sigma = mean(x_sigma)) %>% #writexl:: write_xlsx(  path = "bal_port.xlsx", col_names = TRUE,   format_headers = TRUE,   use_zip64 = FALSE)
+  left_join(assetdb, by = c("asset" = "asset_name")) %>% select(asset_type, car, x_sigma) %>% gather(risk_type, risk, - asset_type) %>%
+  ggplot(aes( x = risk_type, y = risk, fill = asset_type)) + 
+  geom_col() + 
+  scale_y_continuous(labels=scales::percent) + 
+  scale_x_discrete(labels = c("Risk Contribution", "Standalone Risk")) + 
+  labs( x = "", y = "Risk %", fill = "", title = "Risk Decomposition per Asset Class") + 
+  theme_minimal()
+  
+rob_opt_df %>% 
+  arrange(desc(port_ret)) %>%
+  mutate(quantile_rank = ntile(port_ret, 100)) %>% filter(quantile_rank <= 50) %>%
+  group_by(asset) %>%
+  summarise(rob_weight = mean(weights), port_ret = mean(port_ret), port_risk = mean(port_risk), car = mean(car), risk = mean(risk), x_sigma = mean(x_sigma)) %>% #writexl:: write_xlsx(  path = "bal_port.xlsx", col_names = TRUE,   format_headers = TRUE,   use_zip64 = FALSE)
+  left_join(assetdb, by = c("asset" = "asset_name")) %>% writexl:: write_xlsx(  path = "dynamic_port_bbg.xlsx", col_names = TRUE,   format_headers = TRUE,   use_zip64 = FALSE)
+
+  rob_opt_df %>% 
+    ggplot(aes(x = weights, y = exp_ret, col = asset)) +
+    geom_point() + 
